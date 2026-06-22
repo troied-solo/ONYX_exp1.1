@@ -87,7 +87,7 @@ let parsedFiles = null;             // last parsed file set, kept for re-runs
 
 const f = n => (n < 0 ? '-' : '') + '$' + Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fk = n => { if (n >= 1000000) return '$' + (n / 1000000).toFixed(1) + 'M'; if (n >= 1000) return '$' + (n / 1000).toFixed(0) + 'K'; return '$' + n.toFixed(0); };
-const sv = id => { document.querySelectorAll('.view').forEach(v => v.classList.remove('on')); document.getElementById(id).classList.add('on'); document.getElementById('app').scrollTo(0, 0); };
+const sv = id => { document.querySelectorAll('.view').forEach(v => v.classList.remove('on')); document.getElementById(id).classList.add('on'); window.scrollTo(0, 0); };
 
 // ─── Initial render ───────────────────────────────────────────────────────
 renderHistory();
@@ -100,8 +100,8 @@ document.getElementById('file-input').addEventListener('change', onFilesSelected
 async function onFilesSelected(e) {
   const files = Array.from(e.target.files || []);
   if (files.length === 0) return;
-  if (files.length < 4) {
-    showToast(`Need all 4 CSVs — got ${files.length}. Trustee summary, nVision balance, nVision transactions, Axiom output.`);
+  if (files.length < 2) {
+    showToast(`Need at least 2 files: Axiom open breaks + nVision transactions. Trustee summary and nVision balance are optional.`);
     e.target.value = '';
     return;
   }
@@ -118,7 +118,12 @@ async function onFilesSelected(e) {
   }
 }
 
-// ─── CSV parsing ──────────────────────────────────────────────────────────
+// ─── File parsing (CSV or XLSX) ───────────────────────────────────────────
+function parseFile(file) {
+  const isXlsx = /\.(xlsx|xls)$/i.test(file.name);
+  return isXlsx ? parseXlsx(file) : parseCsv(file);
+}
+
 function parseCsv(file) {
   return new Promise((resolve, reject) => {
     Papa.parse(file, {
@@ -128,6 +133,28 @@ function parseCsv(file) {
       complete: r => resolve({ name: file.name, rows: r.data, fields: r.meta.fields || [] }),
       error: err => reject(err),
     });
+  });
+}
+
+function parseXlsx(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array', cellDates: false });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        if (!sheet) return reject(new Error(`${file.name}: no sheets found`));
+        // raw:false → format dates/numbers to strings; defval:'' → fill empty cells
+        const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
+        // Field names come from the first row's keys (header row)
+        const fields = rows.length > 0 ? Object.keys(rows[0]) : [];
+        resolve({ name: file.name, rows, fields });
+      } catch (err) {
+        reject(err);
+      }
+    };
+    reader.onerror = () => reject(reader.error || new Error('FileReader failed'));
+    reader.readAsArrayBuffer(file);
   });
 }
 
@@ -147,9 +174,9 @@ async function runPipeline(files) {
   /* ── Stage 1 (Orchestration): Parse & validate ─────────────────────── */
   startStep(0, 'Parsing the export files');
 
-  const parsed = await Promise.all(files.map(parseCsv));
+  const parsed = await Promise.all(files.map(parseFile));
   await subSleep();
-  addSub(0, 'Reading files', `${parsed.length} CSVs`, 'OK');
+  addSub(0, 'Reading files', `${parsed.length} files`, 'OK');
 
   const identified = {};
   for (const p of parsed) {
@@ -157,36 +184,71 @@ async function runPipeline(files) {
     if (kind) identified[kind] = p;
   }
 
-  const missing = ['trustee_summary', 'nvision_balance', 'nvision_transactions', 'axiom_output'].filter(k => !identified[k]);
-  if (missing.length > 0) {
-    throw new Error(`Could not identify file types: ${missing.join(', ')}. Check column headers.`);
+  // Required files
+  const required = [
+    ['axiom_output', 'Axiom open breaks'],
+    ['nvision_transactions', 'nVision transactions'],
+  ];
+  const requiredMissing = required.filter(([k]) => !identified[k]).map(([, label]) => label);
+  if (requiredMissing.length > 0) {
+    throw new Error(`Missing required file(s): ${requiredMissing.join(', ')}. Check column headers.`);
   }
 
+  const haveTrustee = !!identified.trustee_summary;
+  const haveBalance = !!identified.nvision_balance;
+  const totalIdentified = 2 + (haveTrustee ? 1 : 0) + (haveBalance ? 1 : 0);
+
   await subSleep();
-  addSub(0, 'Identified file types', '4 of 4', 'OK');
+  addSub(0, 'Identified file types', `${totalIdentified} of 4`, totalIdentified === 4 ? 'OK' : 'WARN');
   await subSleep();
   addSub(0, 'Axiom open breaks', `${identified.axiom_output.rows.length} rows`, 'OK');
   await subSleep();
-  addSub(0, 'Trustee accounts', `${identified.trustee_summary.rows.length} rows`, 'OK');
-  await subSleep();
-  addSub(0, 'nVision balances', `${identified.nvision_balance.rows.length} rows`, 'OK');
-  await subSleep();
   addSub(0, 'nVision transactions', `${identified.nvision_transactions.rows.length} rows`, 'OK');
+  if (haveTrustee) {
+    await subSleep();
+    addSub(0, 'Trustee accounts', `${identified.trustee_summary.rows.length} rows`, 'OK');
+  }
+  if (haveBalance) {
+    await subSleep();
+    addSub(0, 'nVision balances', `${identified.nvision_balance.rows.length} rows`, 'OK');
+  }
 
-  const fundIds = uniqBy(identified.nvision_balance.rows, r => r.FUNDID).map(r => r.FUNDID).filter(Boolean);
+  // Detect fund IDs from whichever sources have them
+  const fundSources = []
+    .concat(haveBalance ? identified.nvision_balance.rows : [])
+    .concat(identified.nvision_transactions.rows);
+  const fundIds = uniqBy(fundSources, r => r.FUNDID).map(r => r.FUNDID).filter(Boolean);
   await subSleep();
-  addSub(0, 'Fund IDs detected', fundIds.join(', '), `${fundIds.length} FOUND`);
+  addSub(0, 'Fund IDs detected', fundIds.join(', ') || '—', `${fundIds.length} FOUND`);
 
   parsedFiles = identified;
-  endStep(0, '0.6s', `Schema validated. <strong>${identified.axiom_output.rows.length} breaks</strong> across <strong>${fundIds.length} fund IDs</strong>.`);
+
+  // Populate the file header with REAL info from the upload
+  const procFn = document.querySelector('.proc-fn');
+  const procFm = document.querySelector('.proc-fm');
+  if (procFn) {
+    const otherCount = parsed.length - 1;   // primary = Axiom; rest are "source files"
+    procFn.textContent = identified.axiom_output.name + (otherCount > 0 ? ` + ${otherCount} source file${otherCount === 1 ? '' : 's'}` : '');
+  }
+  if (procFm) {
+    const asOf = identified.axiom_output.rows[0]?.ASOFDATE || '—';
+    const totalRows = parsed.reduce((s, p) => s + (p.rows?.length || 0), 0);
+    procFm.textContent = `${identified.axiom_output.rows.length} breaks · ${totalRows} total rows · ${fundIds.join(', ') || '—'} · ${asOf}`;
+  }
+
+  endStep(0, '0.6s', `Schema validated. <strong>${identified.axiom_output.rows.length} breaks</strong> across <strong>${fundIds.length} fund ID${fundIds.length === 1 ? '' : 's'}</strong>.`);
 
   /* ── Stage 2 (Data Agent): Cross-reference sources ─────────────────── */
   startStep(1, 'Cross-referencing sources');
 
-  await subSleep();
-  addSub(1, 'Querying Trustee — cash accounts', `${identified.trustee_summary.rows.length} records`, 'OK');
-  await subSleep();
-  addSub(1, 'Querying nVision — clearing balances', `${identified.nvision_balance.rows.length} records`, 'OK');
+  if (haveTrustee) {
+    await subSleep();
+    addSub(1, 'Querying Trustee — cash accounts', `${identified.trustee_summary.rows.length} records`, 'OK');
+  }
+  if (haveBalance) {
+    await subSleep();
+    addSub(1, 'Querying nVision — clearing balances', `${identified.nvision_balance.rows.length} records`, 'OK');
+  }
   await subSleep();
   addSub(1, 'Querying nVision — transactions', `${identified.nvision_transactions.rows.length} records`, 'OK');
 
@@ -273,18 +335,23 @@ async function runPipeline(files) {
   BALANCE = buildBalance(identified);
   ACTIVITY = buildActivity(identified);
 
-  // Save a history record
+  // Save a history record with a unique runId so we can rehydrate this run later
   const totalExposure = enriched.reduce((s, b) => s + Math.abs(b.amount), 0);
-  pushHistory({
-    date: formatDate(today),
-    breaks: enriched.length,
-    resolved: 0,
-    carried: enriched.length,
-    exposure: totalExposure,
-    avg: totalExposure / Math.max(enriched.length, 1),
-    ttr: '—',
-    status: 'open',
-  });
+  const runId = 'run_' + Date.now();
+  pushHistory(
+    {
+      runId,
+      date: formatDate(today),
+      breaks: enriched.length,
+      resolved: 0,
+      carried: enriched.length,
+      exposure: totalExposure,
+      avg: totalExposure / Math.max(enriched.length, 1),
+      ttr: '—',
+      status: 'open',
+    },
+    { DATA, BALANCE, ACTIVITY, resolved: [] },
+  );
   renderHistory();
 
   document.getElementById('proc-stat').className = 'proc-stat done';
@@ -452,6 +519,8 @@ function adaptForUI(b) {
 
 // ─── Balance / activity tables (for the queue page tabs) ─────────────────
 function buildBalance(files) {
+  // Both optional files are needed for any meaningful balance comparison
+  if (!files.nvision_balance || !files.trustee_summary) return [];
   return (files.nvision_balance.rows || []).map(r => {
     const nv = parseFloat(r.TDCASHBALANCE) || 0;
     // Try to find a matching trustee account by account name
@@ -476,14 +545,32 @@ function matchTrusteeBalance(nvRow, trusteeRows) {
 }
 
 function buildActivity(files) {
-  return (files.nvision_transactions.rows || []).slice(0, 50).map((r, i) => ({
-    src: 'nVision',
-    issuer: r.ISSUERNAME || '—',
-    asset: r.ASSETNAME || '—',
-    amount: 0,   // transactions file doesn't include amount in the sample
-    acct: r.CLEARINGACCOUNTNAME || '—',
-    match: 'matched',
-  }));
+  // The nVision transactions file has no amount column — derive amounts from
+  // any matching break (by issuer key). Transactions with no matching break
+  // are "Matched" (no discrepancy); transactions with a matching break carry
+  // that break's amount and are flagged "Unmatched".
+  const breakByIssuerKey = new Map();
+  for (const row of (files.axiom_output?.rows || [])) {
+    const issuer = (row.ISSUERNAME || row.DESCRIPTION || '').trim();
+    const key = issuer.toLowerCase().slice(0, 10);
+    if (key && !breakByIssuerKey.has(key)) {
+      breakByIssuerKey.set(key, parseFloat(row.AMOUNT) || 0);
+    }
+  }
+
+  return (files.nvision_transactions.rows || []).slice(0, 50).map(r => {
+    const issuer = (r.ISSUERNAME || '').trim();
+    const key = issuer.toLowerCase().slice(0, 10);
+    const breakAmount = breakByIssuerKey.get(key);
+    return {
+      src: 'nVision',
+      issuer: issuer || '—',
+      asset: r.ASSETNAME || '—',
+      amount: breakAmount || 0,
+      acct: r.CLEARINGACCOUNTNAME || '—',
+      match: breakAmount ? 'unmatched' : 'matched',
+    };
+  });
 }
 
 // ─── Processing-page stream helpers ───────────────────────────────────────
@@ -491,6 +578,12 @@ function resetProcessingUI() {
   document.getElementById('go-banner').classList.remove('show');
   document.getElementById('proc-stat').className = 'proc-stat';
   document.getElementById('proc-stat').innerHTML = '<span class="spin"><svg width="12" height="12"><use href="#i-loader"/></svg></span>Processing';
+
+  // Clear the file header — populated dynamically once files are identified
+  const procFn = document.querySelector('.proc-fn');
+  const procFm = document.querySelector('.proc-fm');
+  if (procFn) procFn.textContent = 'Reading uploaded files...';
+  if (procFm) procFm.textContent = '';
 
   const AGENTS = ['Orchestration Agent', 'Data Agent', 'Reconciliation Agent', 'Orchestration Agent'];
   const ICONS = ['i-topology', 'i-database', 'i-git-compare', 'i-topology'];
@@ -568,20 +661,27 @@ function updateProcessingSidebar(breaks, exposure) {
 const subSleep = () => new Promise(r => setTimeout(r, 120 + Math.random() * 120));
 
 // ─── History (localStorage-backed for one-user PoC) ───────────────────────
+const RUN_KEY = id => 'onyx_run_' + id;
+
 function loadHistory() {
   try {
     const raw = localStorage.getItem('onyx_history');
     if (raw) return JSON.parse(raw);
   } catch (e) {}
-  // Seed with a single sample entry so the table isn't empty on first visit
+  // Seed with a single sample entry so the table isn't empty on first visit.
+  // Note: no runId — clicking it just shows a toast (no real data behind it).
   return [
-    { date: '14 Jan 2026', breaks: 87, resolved: 82, carried: 5, exposure: 11400000, avg: 131034, ttr: '4.2 min', status: 'done' },
+    { runId: null, date: '14 Jan 2026', breaks: 87, resolved: 82, carried: 5, exposure: 11400000, avg: 131034, ttr: '4.2 min', status: 'done' },
   ];
 }
 
-function pushHistory(entry) {
+function pushHistory(entry, runData) {
   HISTORY = [entry, ...HISTORY].slice(0, 14);
   try { localStorage.setItem('onyx_history', JSON.stringify(HISTORY)); } catch (e) {}
+  if (entry.runId && runData) {
+    try { localStorage.setItem(RUN_KEY(entry.runId), JSON.stringify(runData)); }
+    catch (e) { console.warn('could not persist run data:', e); }
+  }
 }
 
 function renderHistory() {
@@ -589,30 +689,118 @@ function renderHistory() {
   c.innerHTML = '';
   HISTORY.forEach(h => {
     const r = document.createElement('div');
-    r.className = 'hist-row';
+    const hasData = !!h.runId;
+    r.className = 'hist-row' + (hasData ? '' : ' no-data');
     r.innerHTML = `
-      <div class="hr-date">${h.date}</div>
+      <div class="hr-date">${escapeHtml(h.date)}</div>
       <div class="hr-num">${h.breaks}</div>
       <div class="hr-num mint">${h.resolved}</div>
       <div class="hr-num ${h.carried > 0 ? 'rose' : 'muted'}">${h.carried}</div>
       <div class="hr-num">${fk(h.exposure)}</div>
       <div class="hr-num muted">${fk(h.avg)}</div>
-      <div class="hr-num muted">${h.ttr}</div>
-      <div><span class="hr-status ${h.status}"><span class="hr-status-dot"></span>${h.status === 'done' ? 'Closed' : 'In progress'}</span></div>`;
+      <div class="hr-num muted">${escapeHtml(h.ttr)}</div>
+      <div><span class="hr-status ${h.status}"><span class="hr-status-dot"></span>${h.status === 'done' ? 'Closed' : 'In progress'}</span></div>
+      <button class="hr-del" title="Delete this run" aria-label="Delete this run"><svg width="14" height="14"><use href="#i-trash"/></svg></button>`;
+
+    // Row click → open run (only if there's data)
+    r.addEventListener('click', (e) => {
+      // Don't fire if the click was on the delete button
+      if (e.target.closest('.hr-del')) return;
+      if (hasData) openHistoryRun(h.runId);
+      else showToast('Sample row — no run data behind it');
+    });
+
+    // Delete click — stop propagation so the row click doesn't also fire
+    r.querySelector('.hr-del').addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteHistoryRun(h.runId, h.date);
+    });
+
     c.appendChild(r);
   });
+}
+
+function openHistoryRun(runId) {
+  let payload = null;
+  try {
+    const raw = localStorage.getItem(RUN_KEY(runId));
+    if (raw) payload = JSON.parse(raw);
+  } catch (e) { console.warn('could not load run:', e); }
+
+  if (!payload || !payload.DATA) {
+    showToast('Run data not found — it may have been cleared from this browser.');
+    return;
+  }
+
+  // Swap current state to the historical run
+  DATA = payload.DATA || [];
+  BALANCE = payload.BALANCE || [];
+  ACTIVITY = payload.ACTIVITY || [];
+  resolved = payload.resolved || [];
+  sel = null;
+  activeFilter = 'all';
+  searchQuery = '';
+
+  sv('v-queue');
+  refreshQueueHeader();
+  renderRows();
+  renderBalance();
+  renderActivity();
+  showToast(`Loaded run from ${new Date(parseInt(runId.replace('run_', ''), 10)).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}`);
+}
+
+function deleteHistoryRun(runId, dateLabel) {
+  HISTORY = HISTORY.filter(h => !(h.runId === runId && h.date === dateLabel));
+  try { localStorage.setItem('onyx_history', JSON.stringify(HISTORY)); } catch (e) {}
+  if (runId) {
+    try { localStorage.removeItem(RUN_KEY(runId)); } catch (e) {}
+  }
+  renderHistory();
+  showToast(`Removed ${dateLabel} from history`);
 }
 
 // ─── Queue / tabs ─────────────────────────────────────────────────────────
 function renderBalance() {
   const c = document.getElementById('balance-rows');
   c.innerHTML = '';
+
+  if (BALANCE.length === 0) {
+    c.innerHTML = `
+      <div style="padding:48px 28px;text-align:center;color:var(--t3);font-size:13px;line-height:1.7">
+        <div style="font-size:14px;color:var(--t1);font-weight:600;margin-bottom:8px">No balance data uploaded</div>
+        Upload the <strong style="color:var(--t1)">Trustee Cash Account Summary</strong> and <strong style="color:var(--t1)">nVision Cash Balance</strong> files to see balance comparisons across both sources.
+      </div>`;
+    // Replace the stats row above with a muted placeholder
+    const sr = document.querySelector('#tab-balance .stats-row');
+    if (sr) {
+      sr.innerHTML = `
+        <div class="stat-tile"><div class="st-l">Accounts</div><div class="st-v">—</div><div class="st-trend">Not uploaded</div></div>
+        <div class="stat-tile"><div class="st-l">Matched</div><div class="st-v">—</div><div class="st-trend">Not uploaded</div></div>
+        <div class="stat-tile"><div class="st-l">Differences</div><div class="st-v">—</div><div class="st-trend">Not uploaded</div></div>
+        <div class="stat-tile"><div class="st-l">Total balance</div><div class="st-v">—</div><div class="st-trend">Not uploaded</div></div>`;
+    }
+    return;
+  }
+
+  // Populate stats row with real numbers
+  const sr = document.querySelector('#tab-balance .stats-row');
+  if (sr) {
+    const matched = BALANCE.filter(b => b.match).length;
+    const diffs = BALANCE.length - matched;
+    const totalBal = BALANCE.reduce((s, b) => s + b.nv, 0);
+    sr.innerHTML = `
+      <div class="stat-tile"><div class="st-l">Accounts</div><div class="st-v">${BALANCE.length}</div><div class="st-trend">All in scope</div></div>
+      <div class="stat-tile mint"><div class="st-l">Matched</div><div class="st-v m">${matched}</div><div class="st-trend up">${Math.round(100 * matched / BALANCE.length)}% match rate</div></div>
+      <div class="stat-tile peach"><div class="st-l">Differences</div><div class="st-v a">${diffs}</div><div class="st-trend">Under review</div></div>
+      <div class="stat-tile gold"><div class="st-l">Total balance</div><div class="st-v g">${fk(totalBal)}</div><div class="st-trend">USD net</div></div>`;
+  }
+
   BALANCE.forEach(b => {
     const diff = b.nv - b.tr;
     const r = document.createElement('div');
     r.className = 'cb-tbl-row';
     r.innerHTML = `
-      <div class="cb-acct"><div>${b.acct}</div><div class="ca-id">CL-${b.id}</div></div>
+      <div class="cb-acct"><div>${escapeHtml(b.acct)}</div><div class="ca-id">CL-${escapeHtml(String(b.id))}</div></div>
       <div class="cb-bal">${b.tr > 0 ? f(b.tr) : '—'}</div>
       <div class="cb-bal">${b.nv > 0 ? f(b.nv) : '—'}</div>
       <div class="cb-diff ${Math.abs(diff) > 0.01 ? 'r' : 'zero'}">${Math.abs(diff) > 0.01 ? f(diff) : '$0.00'}</div>
@@ -657,6 +845,15 @@ function refreshQueueHeader() {
       <div class="stat-tile gold"><div class="st-l">Total exposure</div><div class="st-v g">${fk(exposure)}</div><div class="st-trend">USD</div></div>
       <div class="stat-tile mint"><div class="st-l">Resolved</div><div class="st-v m" id="res-count">${resolved.length}</div><div class="st-trend">This run</div></div>`;
   }
+
+  // Dynamic tab counts (were hardcoded as 92 / 6 / 38 in the HTML)
+  const setCount = (tab, val) => {
+    const el = document.querySelector(`.tab[data-tab="${tab}"] .tab-count`);
+    if (el) el.textContent = val;
+  };
+  setCount('breaks', DATA.length);
+  setCount('balance', BALANCE.length || '—');
+  setCount('activity', ACTIVITY.length);
 }
 
 document.querySelectorAll('.tab').forEach(b => {
@@ -856,7 +1053,7 @@ function buildInv(b) {
       <div class="dm-acts">
         <button class="btn-resolve" onclick="toggleStatus(${b.id})"><svg width="13" height="13"><use href="#i-circle-check"/></svg>Mark resolved</button>
         <button class="btn-escalate" onclick="openEmail(${b.id})"><svg width="13" height="13"><use href="#i-mail"/></svg>Escalate via email</button>
-        <button class="btn-edit"><svg width="13" height="13"><use href="#i-pencil"/></svg>Edit note</button>
+        <button class="btn-edit" id="edit-note-btn" onclick="toggleEditNote(${b.id})"><svg width="13" height="13"><use href="#i-pencil"/></svg>Edit note</button>
       </div>
     </div>`;
   orchCard.innerHTML = `
@@ -945,6 +1142,101 @@ function showToast(msg) { const t = document.getElementById('toast'); document.g
 document.querySelectorAll('.tbl-hd .th, .cb-tbl-hd .th, .ca-tbl-hd .th, .hist-thead .th').forEach(th => {
   th.onclick = () => { th.parentElement.querySelectorAll('.th').forEach(x => x.classList.remove('sorted')); th.classList.add('sorted'); };
 });
+
+// Brand / logo click — back to landing
+document.querySelector('.brand').addEventListener('click', () => sv('v-upload'));
+
+// ─── Edit Note (inline edit of the recommendation draft) ──────────────────
+window.toggleEditNote = function (id) {
+  const b = DATA.find(x => x.id === id);
+  if (!b) return;
+  const draftEl = document.querySelector('.dm-draft');
+  const editBtn = document.getElementById('edit-note-btn');
+  if (!draftEl || !editBtn) return;
+
+  const isEditing = draftEl.tagName === 'TEXTAREA';
+
+  if (isEditing) {
+    // Save mode — persist text, restore the div
+    const newText = draftEl.value.trim();
+    b.draft = newText;
+    const div = document.createElement('div');
+    div.className = 'dm-draft';
+    div.textContent = newText;
+    draftEl.replaceWith(div);
+    editBtn.innerHTML = '<svg width="13" height="13"><use href="#i-pencil"/></svg>Edit note';
+    showToast('Note updated');
+  } else {
+    // Edit mode — swap div for a textarea
+    const ta = document.createElement('textarea');
+    ta.className = 'dm-draft';
+    ta.value = draftEl.textContent || '';
+    ta.style.cssText = 'width:100%;min-height:96px;font-family:inherit;font-size:12.5px;color:var(--t2);line-height:1.7;background:var(--s2);border:1px solid var(--gold);border-radius:9px;padding:13px 15px;resize:vertical;outline:none';
+    draftEl.replaceWith(ta);
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+    editBtn.innerHTML = '<svg width="13" height="13"><use href="#i-check"/></svg>Save note';
+  }
+};
+
+// ─── Export break investigation as JSON ───────────────────────────────────
+function exportBreak(b) {
+  if (!b) { showToast('No break selected to export'); return; }
+  const payload = {
+    id: b.id,
+    issuer: b.issuer,
+    fund: b.fund,
+    account: b.acct,
+    source: b.src,
+    amount: b.delta,
+    currency: 'USD',
+    age_days: b.age,
+    classification: {
+      type: b.type,
+      confidence: b.conf,
+      pattern: b.pat,
+      severity: b.sev,
+    },
+    source_records: {
+      trustee_amount: b.tr || null,
+      nvision_amount: b.nv || null,
+      as_of_date: b._enriched?.asOfDate,
+      value_date: b._enriched?.valueDate,
+      settle_date: b._enriched?.settleDate,
+    },
+    agent_findings: {
+      data_agent: {
+        matched_in_other_source: !!b._enriched?.matchedInOtherSource,
+        counterpart_hints: b._enriched?.counterpartHints || '',
+        nvision_matches: b._enriched?.raw?.nvisionMatches || [],
+      },
+      reconciliation_agent: {
+        classification: b.type,
+        confidence: b.conf,
+        pattern: b.pat,
+      },
+      orchestration_agent: {
+        recommendation: b.draft || null,
+      },
+    },
+    assignee: b.assignee,
+    resolved: resolved.includes(b.id),
+    exported_at: new Date().toISOString(),
+  };
+
+  const safeName = (b.issuer || 'break').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 30);
+  const filename = `onyx_break_${String(b.id).padStart(3, '0')}_${safeName}.json`;
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast(`Exported ${filename}`);
+}
+
+// Wire the Export button at the top of the investigation page
+document.getElementById('inv-export-btn').addEventListener('click', () => exportBreak(sel));
 
 // ─── Utilities ────────────────────────────────────────────────────────────
 function uniqBy(arr, fn) { const seen = new Set(); return arr.filter(x => { const k = fn(x); if (seen.has(k)) return false; seen.add(k); return true; }); }
