@@ -119,6 +119,12 @@ async function onFilesSelected(e) {
 }
 
 // ─── File parsing (CSV or XLSX) ───────────────────────────────────────────
+// Normalize column header to all-caps, no whitespace/punctuation, so that
+// "Deal Name", "DealName", "DEAL_NAME", and "deal name" all collapse to "DEALNAME".
+function normKey(s) {
+  return String(s == null ? '' : s).toUpperCase().replace(/[\s\-_\.\(\)\/]+/g, '');
+}
+
 function parseFile(file) {
   const isXlsx = /\.(xlsx|xls)$/i.test(file.name);
   return isXlsx ? parseXlsx(file) : parseCsv(file);
@@ -129,8 +135,17 @@ function parseCsv(file) {
     Papa.parse(file, {
       header: true,
       skipEmptyLines: true,
-      dynamicTyping: false,   // keep strings; we'll coerce explicitly
-      complete: r => resolve({ name: file.name, rows: r.data, fields: r.meta.fields || [] }),
+      dynamicTyping: false,
+      complete: r => {
+        const origFields = r.meta.fields || [];
+        const fields = origFields.map(normKey);
+        const rows = r.data.map(row => {
+          const out = {};
+          for (const k of origFields) out[normKey(k)] = row[k];
+          return out;
+        });
+        resolve({ name: file.name, rows, fields });
+      },
       error: err => reject(err),
     });
   });
@@ -141,12 +156,25 @@ function parseXlsx(file) {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array', cellDates: false });
+        // cellDates:true → Date objects in cells, instead of Excel serial numbers
+        const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array', cellDates: true });
         const sheet = wb.Sheets[wb.SheetNames[0]];
         if (!sheet) return reject(new Error(`${file.name}: no sheets found`));
-        // raw:false → format dates/numbers to strings; defval:'' → fill empty cells
-        const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
-        // Field names come from the first row's keys (header row)
+        // raw:true → native JS types (numbers as numbers, dates as Date objects)
+        const raw = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true });
+        const rows = raw.map(row => {
+          const out = {};
+          for (const k in row) {
+            const nk = normKey(k);
+            let v = row[k];
+            // Excel dates → YYYY-MM-DD (UTC, to dodge midnight-rounding drift in local TZ)
+            if (v instanceof Date && !isNaN(v.getTime())) {
+              v = v.getUTCFullYear() + '-' + String(v.getUTCMonth() + 1).padStart(2, '0') + '-' + String(v.getUTCDate()).padStart(2, '0');
+            }
+            out[nk] = v;
+          }
+          return out;
+        });
         const fields = rows.length > 0 ? Object.keys(rows[0]) : [];
         resolve({ name: file.name, rows, fields });
       } catch (err) {
@@ -252,8 +280,9 @@ async function runPipeline(files) {
   await subSleep();
   addSub(1, 'Querying nVision — transactions', `${identified.nvision_transactions.rows.length} records`, 'OK');
 
-  // Enrich each axiom break with matched-record evidence
-  const today = new Date('2026-01-15');   // demo "today" — fixed for sample data
+  // Enrich each axiom break with matched-record evidence.
+  // "Today" = the Asofdate from the Axiom export, falling back to the system clock.
+  const today = parseDate(identified.axiom_output.rows[0]?.ASOFDATE) || new Date();
   const enriched = identified.axiom_output.rows.map((row, idx) => enrichBreak(row, idx + 1, identified, today));
   const matched = enriched.filter(b => b.matchedInOtherSource).length;
   const unmatched = enriched.length - matched;
@@ -378,24 +407,40 @@ function enrichBreak(row, id, files, today) {
   const settleDate = row.SETTLEDATE || '';
   const input = (row.INPUT || '').trim();
   const description = (row.DESCRIPTION || '').trim();
-  const issuer = (row.ISSUERNAME || description).trim();
-  const ageInDays = computeAgeDays(asOf, valueDate, today);
+  const issuerName = (row.ISSUERNAME || '').trim();
+  // Prefer the longer Description for human display when available — it carries
+  // more context (e.g. "NEMTSEVN TAIDEMRETN GNIDLO N" vs just "NEMTSEVN TAIDEMRETN").
+  const issuer = description || issuerName;
 
-  // Look for a transaction in nVision transactions whose description/issuer roughly matches
-  const issuerKey = issuer.toLowerCase().slice(0, 10);
-  const matches = (files.nvision_transactions.rows || []).filter(t =>
-    (t.ISSUERNAME || '').toLowerCase().slice(0, 10) === issuerKey,
+  // Axiom carries a pre-computed Ageing (in days). Use it when present;
+  // fall back to computing from VALUEDATE → today if not.
+  const ageingRaw = parseInt(row.AGEING, 10);
+  const ageInDays = Number.isFinite(ageingRaw) && ageingRaw >= 0
+    ? ageingRaw
+    : computeAgeDays(asOf, valueDate, today);
+
+  // Optional context columns from Axiom — used downstream for display
+  const accountGroup = (row.ACCOUNTGROUP || row.ACCOUNTNAME || '').trim();
+  const fundName = (row.FUNDNAME || '').trim();
+  const assignedTo = (row.ASSIGNEDTO || '').trim();
+
+  // Match against nVision transactions by short issuer-name prefix
+  const matchKey = (issuerName || description).toLowerCase().slice(0, 10);
+  const matches = (files.nvision_transactions?.rows || []).filter(t =>
+    (t.ISSUERNAME || '').toLowerCase().slice(0, 10) === matchKey,
   );
 
-  // Best-effort: matched if the OTHER side has the same issuer
-  const otherSide = input === 'Trustee' ? 'nVision' : 'Trustee';
+  // matchedInOtherSource means: this break exists on one side, and we did
+  // find a transaction on the OTHER side that could be its counterpart.
   let matchedInOtherSource = false;
   let counterpartHints = '';
   if (input === 'nVision') {
-    // Other side is Trustee — see if any trustee account references this issuer
+    // The break is on nVision's side; the other side is Trustee. Trustee summary
+    // is account-level only — no transaction-level counterpart is available.
     matchedInOtherSource = false;
     counterpartHints = 'Trustee summary is account-level; no transaction-level counterpart available.';
   } else if (input === 'Trustee') {
+    // The break is on Trustee's side; check if nVision has a corresponding txn.
     matchedInOtherSource = matches.length > 0;
     counterpartHints = matches.length > 0
       ? `Found ${matches.length} nVision transaction(s) with the same issuer.`
@@ -411,10 +456,13 @@ function enrichBreak(row, id, files, today) {
     input,
     description,
     issuer,
+    issuerName,
+    accountGroup,
+    fundName,
+    assignedTo,
     ageInDays,
     matchedInOtherSource,
     counterpartHints,
-    // raw source records kept around for the investigation page
     raw: {
       nvisionMatches: matches.slice(0, 3),
     },
@@ -430,13 +478,19 @@ function computeAgeDays(asOf, valueDate, today) {
 }
 
 function parseDate(s) {
-  if (!s) return null;
-  // accept YYYY-MM-DD or MM/DD/YYYY
-  const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-  if (iso) return new Date(+iso[1], +iso[2] - 1, +iso[3]);
-  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
-  if (us) return new Date(+us[3], +us[1] - 1, +us[2]);
-  return null;
+  if (!s && s !== 0) return null;
+  if (s instanceof Date) return isNaN(s.getTime()) ? null : s;
+  const str = String(s).trim();
+  if (!str) return null;
+  // ISO date or datetime: 2026-01-05 or 2026-01-05 03:00:00 or 2026-01-05T03:00:00
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(str);
+  if (iso) return new Date(Date.UTC(+iso[1], +iso[2] - 1, +iso[3]));
+  // US format MM/DD/YYYY
+  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(str);
+  if (us) return new Date(Date.UTC(+us[3], +us[1] - 1, +us[2]));
+  // Last resort: let the browser try
+  const d = new Date(str);
+  return isNaN(d.getTime()) || d.getFullYear() < 1970 ? null : d;
 }
 
 // ─── Classification: call /api/classify in parallel batches ───────────────
@@ -483,9 +537,8 @@ async function callClassify(batch) {
 // ─── Convert enriched break to the shape the existing UI expects ──────────
 function adaptForUI(b) {
   const sevMap = { critical: 'critical', warning: 'warning', normal: 'normal' };
-  const fundId = b.input === 'Trustee' ? 'WSSA RA' : 'WSSA RA';   // best-effort; could come from raw
 
-  // Pick a fake assignee deterministically by id so it's stable across re-runs
+  // Fake-assignee fallback (used if Axiom row didn't carry an Assigned To)
   const assignees = [
     { name: 'R. Costa', code: 'a' },
     { name: 'M. Halvorsen', code: 'b' },
@@ -494,13 +547,15 @@ function adaptForUI(b) {
     { name: 'J. Castellano', code: 'e' },
     { name: 'A. Nair', code: 'a' },
   ];
-  const a = assignees[b.id % assignees.length];
+  const fallback = assignees[b.id % assignees.length];
+  const assigneeName = b.assignedTo || fallback.name;
+  const assigneeCode = b.assignedTo ? 'a' : fallback.code;
 
   return {
     id: b.id,
     issuer: b.issuer || b.description,
-    fund: fundId,
-    acct: b.input === 'Trustee' ? 'WSSA R S N' : 'WSSA R S NO IR',
+    fund: b.fundName || (b.input === 'Trustee' ? 'WSSA RA' : 'WSSA RA'),
+    acct: b.accountGroup || (b.input === 'Trustee' ? 'WSSA R S N' : 'WSSA R S NO IR'),
     src: b.input,
     delta: b.amount,
     age: b.ageInDays,
@@ -509,8 +564,8 @@ function adaptForUI(b) {
     tr: b.input === 'Trustee' ? b.amount : 0,
     nv: b.input === 'nVision' ? b.amount : 0,
     conf: b.confidence,
-    assignee: a.name,
-    assn: a.code,
+    assignee: assigneeName,
+    assn: assigneeCode,
     pat: b.pattern,
     draft: null,            // generated on demand by /api/draft-resolution
     _enriched: b,           // keep the original for the investigation page
@@ -545,10 +600,8 @@ function matchTrusteeBalance(nvRow, trusteeRows) {
 }
 
 function buildActivity(files) {
-  // The nVision transactions file has no amount column — derive amounts from
-  // any matching break (by issuer key). Transactions with no matching break
-  // are "Matched" (no discrepancy); transactions with a matching break carry
-  // that break's amount and are flagged "Unmatched".
+  // Build a quick index: issuer-key → break amount, so we can flag transactions
+  // that correspond to an open break.
   const breakByIssuerKey = new Map();
   for (const row of (files.axiom_output?.rows || [])) {
     const issuer = (row.ISSUERNAME || row.DESCRIPTION || '').trim();
@@ -562,11 +615,14 @@ function buildActivity(files) {
     const issuer = (r.ISSUERNAME || '').trim();
     const key = issuer.toLowerCase().slice(0, 10);
     const breakAmount = breakByIssuerKey.get(key);
+    // Prefer the transaction's own TDAmount (the real transaction amount) when present.
+    // If absent, fall back to the matching break's amount for context. Otherwise 0.
+    const txAmount = parseFloat(r.TDAMOUNT) || 0;
     return {
       src: 'nVision',
       issuer: issuer || '—',
       asset: r.ASSETNAME || '—',
-      amount: breakAmount || 0,
+      amount: txAmount || breakAmount || 0,
       acct: r.CLEARINGACCOUNTNAME || '—',
       match: breakAmount ? 'unmatched' : 'matched',
     };
@@ -801,8 +857,8 @@ function renderBalance() {
     r.className = 'cb-tbl-row';
     r.innerHTML = `
       <div class="cb-acct"><div>${escapeHtml(b.acct)}</div><div class="ca-id">CL-${escapeHtml(String(b.id))}</div></div>
-      <div class="cb-bal">${b.tr > 0 ? f(b.tr) : '—'}</div>
-      <div class="cb-bal">${b.nv > 0 ? f(b.nv) : '—'}</div>
+      <div class="cb-bal">${b.tr !== 0 ? f(b.tr) : '—'}</div>
+      <div class="cb-bal">${b.nv !== 0 ? f(b.nv) : '—'}</div>
       <div class="cb-diff ${Math.abs(diff) > 0.01 ? 'r' : 'zero'}">${Math.abs(diff) > 0.01 ? f(diff) : '$0.00'}</div>
       <div><span class="fnd-tag-mini ${b.match ? 'ok' : 'no'}">${b.match ? 'Matched' : 'Diff'}</span></div>
       <div><span class="status-tag ${b.match ? 'resolved' : 'open'}">${b.match ? 'Closed' : 'Open'}</span></div>`;
@@ -998,7 +1054,9 @@ function buildInv(b) {
   const sec1 = document.createElement('div');
   sec1.innerHTML = `<div class="inv-section-h"><div class="iv-sh-title">Source comparison</div><div class="iv-sh-desc">What each system reports for this break. The gap between them is the case.</div></div>`;
   const cmp = document.createElement('div'); cmp.className = 'cmp-3';
-  cmp.innerHTML = `<div class="cmp-tile tr"><div class="cmp-h"><div class="cmp-src tr">Trustee</div></div><div class="cmp-amt ${b.tr > 0 ? '' : 'missing'}">${b.tr > 0 ? f(b.tr) : 'No record'}</div><div class="cmp-row"><span class="cmp-l">Account</span><span class="cmp-v">${escapeHtml(b.acct)}</span></div><div class="cmp-row"><span class="cmp-l">As of</span><span class="cmp-v">${escapeHtml(b._enriched?.asOfDate || '—')}</span></div><div class="cmp-row"><span class="cmp-l">Feed</span><span class="cmp-v ${b.tr > 0 ? 'ok' : 'bad'}">${b.tr > 0 ? 'Found' : 'Missing'}</span></div></div><div class="cmp-tile nv"><div class="cmp-h"><div class="cmp-src nv">nVision</div></div><div class="cmp-amt ${b.nv > 0 ? '' : 'missing'}">${b.nv > 0 ? f(b.nv) : 'No record'}</div><div class="cmp-row"><span class="cmp-l">Value date</span><span class="cmp-v">${escapeHtml(b._enriched?.valueDate || '—')}</span></div><div class="cmp-row"><span class="cmp-l">Settle</span><span class="cmp-v">${escapeHtml(b._enriched?.settleDate || '—')}</span></div><div class="cmp-row"><span class="cmp-l">Feed</span><span class="cmp-v ${b.nv > 0 ? 'ok' : 'bad'}">${b.nv > 0 ? 'Found' : 'Missing'}</span></div></div><div class="cmp-tile diff"><div class="cmp-h"><div class="cmp-src diff">Break</div></div><div class="cmp-amt r">${f(b.delta)}</div><div class="cmp-row"><span class="cmp-l">Type</span><span class="cmp-v">${escapeHtml(b.type)}</span></div><div class="cmp-row"><span class="cmp-l">Age</span><span class="cmp-v">${b.age} days</span></div><div class="cmp-row"><span class="cmp-l">Priority</span><span class="cmp-v" style="color:${b.sev === 'critical' ? 'var(--rose)' : 'var(--peach)'}">${b.sev === 'critical' ? 'Critical' : 'High'}</span></div></div>`;
+  const hasTr = b.src === 'Trustee';
+  const hasNv = b.src === 'nVision';
+  cmp.innerHTML = `<div class="cmp-tile tr"><div class="cmp-h"><div class="cmp-src tr">Trustee</div></div><div class="cmp-amt ${hasTr ? '' : 'missing'}">${hasTr ? f(b.tr) : 'No record'}</div><div class="cmp-row"><span class="cmp-l">Account</span><span class="cmp-v">${escapeHtml(b.acct)}</span></div><div class="cmp-row"><span class="cmp-l">As of</span><span class="cmp-v">${escapeHtml(b._enriched?.asOfDate || '—')}</span></div><div class="cmp-row"><span class="cmp-l">Feed</span><span class="cmp-v ${hasTr ? 'ok' : 'bad'}">${hasTr ? 'Found' : 'Missing'}</span></div></div><div class="cmp-tile nv"><div class="cmp-h"><div class="cmp-src nv">nVision</div></div><div class="cmp-amt ${hasNv ? '' : 'missing'}">${hasNv ? f(b.nv) : 'No record'}</div><div class="cmp-row"><span class="cmp-l">Value date</span><span class="cmp-v">${escapeHtml(b._enriched?.valueDate || '—')}</span></div><div class="cmp-row"><span class="cmp-l">Settle</span><span class="cmp-v">${escapeHtml(b._enriched?.settleDate || '—')}</span></div><div class="cmp-row"><span class="cmp-l">Feed</span><span class="cmp-v ${hasNv ? 'ok' : 'bad'}">${hasNv ? 'Found' : 'Missing'}</span></div></div><div class="cmp-tile diff"><div class="cmp-h"><div class="cmp-src diff">Break</div></div><div class="cmp-amt r">${f(b.delta)}</div><div class="cmp-row"><span class="cmp-l">Type</span><span class="cmp-v">${escapeHtml(b.type)}</span></div><div class="cmp-row"><span class="cmp-l">Age</span><span class="cmp-v">${b.age} days</span></div><div class="cmp-row"><span class="cmp-l">Priority</span><span class="cmp-v" style="color:${b.sev === 'critical' ? 'var(--rose)' : 'var(--peach)'}">${b.sev === 'critical' ? 'Critical' : 'High'}</span></div></div>`;
   sec1.appendChild(cmp); M.appendChild(sec1);
 
   // Detail
@@ -1023,8 +1081,8 @@ function buildInv(b) {
     <div class="agent-card-detail">${escapeHtml(matchTxt)}</div>
     <div class="agent-card-body">
       <div class="atl-findings">
-        <div class="atl-finding"><span class="atl-finding-l">Trustee — ${escapeHtml(b.acct)}</span><span class="atl-finding-r"><span class="atl-finding-v">${b.tr > 0 ? f(b.tr) : 'No record'}</span><span class="fnd-tag-mini ${b.tr > 0 ? 'ok' : 'no'}">${b.tr > 0 ? 'Found' : 'Missing'}</span></span></div>
-        <div class="atl-finding"><span class="atl-finding-l">nVision — value ${escapeHtml(b._enriched?.valueDate || '—')}</span><span class="atl-finding-r"><span class="atl-finding-v">${b.nv > 0 ? f(b.nv) : 'No record'}</span><span class="fnd-tag-mini ${b.nv > 0 ? 'ok' : 'no'}">${b.nv > 0 ? 'Found' : 'Missing'}</span></span></div>
+        <div class="atl-finding"><span class="atl-finding-l">Trustee — ${escapeHtml(b.acct)}</span><span class="atl-finding-r"><span class="atl-finding-v">${hasTr ? f(b.tr) : 'No record'}</span><span class="fnd-tag-mini ${hasTr ? 'ok' : 'no'}">${hasTr ? 'Found' : 'Missing'}</span></span></div>
+        <div class="atl-finding"><span class="atl-finding-l">nVision — value ${escapeHtml(b._enriched?.valueDate || '—')}</span><span class="atl-finding-r"><span class="atl-finding-v">${hasNv ? f(b.nv) : 'No record'}</span><span class="fnd-tag-mini ${hasNv ? 'ok' : 'no'}">${hasNv ? 'Found' : 'Missing'}</span></span></div>
         <div class="atl-finding"><span class="atl-finding-l">Counterpart search</span><span class="atl-finding-r"><span class="atl-finding-v">${b._enriched?.raw?.nvisionMatches?.length || 0} matched</span><span class="fnd-tag-mini ${b._enriched?.matchedInOtherSource ? 'ok' : 'no'}">${b._enriched?.matchedInOtherSource ? 'Matched' : 'No counterpart'}</span></span></div>
       </div>
     </div>`;
